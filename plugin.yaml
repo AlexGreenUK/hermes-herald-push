@@ -1,0 +1,19 @@
+name: herald-push
+label: Herald push
+version: 0.1.0
+manifest_version: 2
+requires_hermes: ">=0.21.5"
+description: >
+  End-to-end encrypted notifications for the Herald Android app, through ntfy, so a phone hears from its
+  bots even when it can't reach the gateway (off the tailnet, on mobile data). Every message is encrypted
+  to the phone's key and signed by the gateway; the ntfy server only carries opaque envelopes. Phones
+  register themselves from Herald over the authenticated dashboard connection.
+author: Giton22
+homepage: https://github.com/Giton22/hermes-herald-push
+license: MIT
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    label: Send notifications
+    description: Push new bot messages to registered phones.
