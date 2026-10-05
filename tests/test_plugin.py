@@ -163,6 +163,49 @@ def test_watcher_skips_stale_replies(tmp_path, monkeypatch):
     assert w.poll() == 0
 
 
+def test_compression_copies_are_not_pushed_twice(tmp_path, monkeypatch):
+    now = 1_800_000_000.0
+    root = tmp_path / "hermes"
+    _make_db(root, [])
+    conn = sqlite3.connect(root / "state.db")
+    conn.execute("ALTER TABLE messages ADD COLUMN _compressed_summary INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+    conn.close()
+    tip = {"id": "s1"}
+    monkeypatch.setattr(watcher, "bot_chat_tip", lambda home: tip["id"] if (home / "state.db").exists() else None)
+    sent = []
+    monkeypatch.setattr(push, "publish", lambda device, payload, sig, client=None: sent.append(payload["text"]) or True)
+    store = Store(tmp_path / "data")
+    store.upsert(Device.parse(phone()[0]))
+    w = watcher.Watcher(root, store, now=lambda: now)
+    w.poll()
+    _add(root, ("s1", "assistant", "Done with the report", None, 1, None, now))
+    assert w.poll() == 1
+    # Compression: a continuation carrying a summary and a copy of the last reply, then a real new reply.
+    tip["id"] = "s2"
+    conn = sqlite3.connect(root / "state.db")
+    conn.execute("INSERT INTO messages (session_id, role, content, active, timestamp, _compressed_summary) "
+                 "VALUES ('s2', 'assistant', 'Summary of earlier', 1, ?, 1)", (now,))
+    conn.execute("INSERT INTO messages (session_id, role, content, active, timestamp) VALUES ('s2', 'assistant', 'Done with the report', 1, ?)", (now,))
+    conn.execute("INSERT INTO messages (session_id, role, content, active, timestamp) VALUES ('s2', 'assistant', 'Something new', 1, ?)", (now,))
+    conn.commit()
+    conn.close()
+    assert w.poll() == 1
+    assert sent == ["Done with the report", "Something new"]
+
+
+def test_concurrent_registrations_from_separate_stores_all_land(tmp_path):
+    import threading
+    phones = [phone(device_id=f"{i:08d}-0000-4000-8000-000000000000")[0] for i in range(8)]
+    threads = [threading.Thread(target=lambda d=d: Store(tmp_path).upsert(Device.parse(d))) for d in phones]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(Store(tmp_path).devices()) == 8
+    assert len({Store(tmp_path).public_identity()["sig_pub"] for _ in range(3)}) == 1
+
+
 def test_pushed_envelope_opens_on_the_phone(tmp_path):
     store = Store(tmp_path)
     data, enc = phone()

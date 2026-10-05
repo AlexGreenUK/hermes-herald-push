@@ -9,9 +9,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -94,17 +96,52 @@ def _write_private(path: Path, data: object) -> None:
         raise
 
 
+# One lock for every Store in this process (the plugin is loaded once per profile, each with its own Store),
+# plus a file lock for the other Hermes processes (dashboard, messaging gateway) sharing the same files.
+_process_lock = threading.RLock()
+
+
+@contextmanager
+def _exclusive(root: Path):
+    with _process_lock:
+        root.mkdir(parents=True, exist_ok=True)
+        with open(root / ".lock", "a+") as fh:
+            if sys.platform == "win32":
+                import msvcrt
+                fh.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                        break
+                    except OSError:  # LK_LOCK gives up after ~10 s; keep waiting
+                        continue
+                try:
+                    yield
+                finally:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root)
-        self._lock = threading.Lock()
+
+    def _lock(self):
+        return _exclusive(self.root)
 
     # ── identity ────────────────────────────────────────────────────────────
 
     def identity(self):
         """(gateway_id, enc private key, sig private key), made once."""
         path = self.root / "identity.json"
-        with self._lock:
+        with self._lock():
             if path.is_file():
                 data = json.loads(path.read_text(encoding="utf-8"))
                 return (data["gateway_id"], crypto.private_from_pem(data["enc"].encode()),
@@ -137,7 +174,7 @@ class Store:
         return out
 
     def upsert(self, device: Device) -> None:
-        with self._lock:
+        with self._lock():
             kept = [d for d in self.devices() if d.device_id != device.device_id]
             # A topic belongs to one phone: a second registration can't take over another phone's topics.
             taken = {t for d in kept for t in (d.push_topic, d.reply_topic)}
@@ -148,7 +185,7 @@ class Store:
             _write_private(self.root / "devices.json", {"devices": [asdict(d) for d in kept + [device]]})
 
     def remove(self, device_id: str) -> bool:
-        with self._lock:
+        with self._lock():
             devices = self.devices()
             kept = [d for d in devices if d.device_id != device_id]
             if len(kept) == len(devices):

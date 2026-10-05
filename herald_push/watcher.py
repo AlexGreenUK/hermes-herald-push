@@ -112,8 +112,11 @@ def new_replies(home: Path, session_id: str, after_id: int) -> Tuple[int, List[T
     uri = f"file:{(home / 'state.db').as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=2.0)
     try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+        # Compression's summaries and compacted copies aren't new words from the bot.
+        carried = " + ".join(c for c in ("_compressed_summary", "compacted") if c in columns) or "0"
         rows = conn.execute(
-            "SELECT id, role, content, tool_calls, active, display_kind, timestamp FROM messages "
+            f"SELECT id, role, content, tool_calls, active, display_kind, timestamp, ({carried}) FROM messages "
             "WHERE session_id = ? AND id > ? ORDER BY id LIMIT 200",
             (session_id, after_id),
         ).fetchall()
@@ -121,9 +124,9 @@ def new_replies(home: Path, session_id: str, after_id: int) -> Tuple[int, List[T
         conn.close()
     newest = after_id
     replies = []
-    for msg_id, role, content, tool_calls, active, display_kind, ts in rows:
+    for msg_id, role, content, tool_calls, active, display_kind, ts, carried_over in rows:
         newest = max(newest, int(msg_id))
-        if role != "assistant" or not active or (tool_calls and tool_calls.strip() not in ("", "[]", "null")):
+        if carried_over or role != "assistant" or not active or (tool_calls and tool_calls.strip() not in ("", "[]", "null")):
             continue
         if display_kind and display_kind not in ("assistant", "message", "text"):
             continue
@@ -195,6 +198,8 @@ class Watcher:
         self._lock = _LeaderLock(store.root / "leader.lock")
         self._marks: Dict[str, int] = {}
         self._tips: Dict[str, str] = {}
+        # Per bot: the texts pushed lately and when, so a compression copy isn't pushed twice.
+        self._pushed: Dict[str, Dict[str, float]] = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -244,7 +249,8 @@ class Watcher:
             self._tips[profile] = tip
             if key not in self._marks:
                 # A chat seen for the first time starts from now; one that replaced the previous tip
-                # (compression) is read from its start, and the staleness check keeps old rows out.
+                # (compression) is read from its start: staleness, the carried-over flags and the
+                # recently-pushed texts keep old rows out.
                 self._marks[key] = 0 if previous_tip and previous_tip != tip else latest_id(home, tip)
                 changed = True
                 if not (previous_tip and previous_tip != tip):
@@ -253,12 +259,21 @@ class Watcher:
             if newest != self._marks[key]:
                 self._marks[key] = newest
                 changed = True
-            fresh = [r for r in replies if self.now() - r[1] <= STALE_SECONDS][-MAX_PER_POLL:]
+            fresh = [r for r in replies if self.now() - r[1] <= STALE_SECONDS]
+            if previous_tip and previous_tip != tip:
+                # A new tip after compression may carry copies of the last replies: they went out already.
+                pushed = self._pushed.get(profile, {})
+                fresh = [r for r in fresh if self.now() - pushed.get(r[2], -STALE_SECONDS * 2) > STALE_SECONDS]
+            fresh = fresh[-MAX_PER_POLL:]
             if not fresh or not devices or not self.enabled():
                 continue
             _, sig = self.store.identity()[1:]
             label = bot_label(home, profile)
+            pushed = self._pushed.setdefault(profile, {})
             for _msg_id, _ts, text in fresh:
+                pushed[text] = self.now()
+                if len(pushed) > 16:
+                    del pushed[next(iter(pushed))]
                 payload = push.message("bot_message", bot=profile, label=label, session=tip, text=push.clip(text))
                 for device in devices:
                     if push.publish(device, payload, sig, client):
