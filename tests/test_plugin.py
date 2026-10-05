@@ -96,8 +96,60 @@ def test_silence_and_long_lived():
     assert watcher.is_silence(" *NO_REPLY* ")
     assert watcher.is_silence("[SILENT]")
     assert not watcher.is_silence("All done")
-    assert watcher.is_long_lived_process(["hermes", "dashboard"])
-    assert not watcher.is_long_lived_process(["hermes", "-p", "x", "chat", "-Q"])
+    # Decided by what is loaded, whatever the launcher was called.
+    assert watcher.is_long_lived_process(["some-launcher", "--port", "9"], modules={"tui_gateway.server": object()})
+    assert watcher.is_long_lived_process(["hermes-backend"], modules={"gateway.run": object()})
+    assert watcher.is_long_lived_process(["hermes", "dashboard"], modules={})
+    assert not watcher.is_long_lived_process(["hermes", "gateway", "status"], modules={})
+    assert not watcher.is_long_lived_process(["hermes", "-p", "x", "chat", "-Q"], modules={"tui_gateway.server": object()})
+
+
+def test_each_bots_own_switch_is_honoured(tmp_path, monkeypatch):
+    now = 1_800_000_000.0
+    root = tmp_path / "hermes"
+    _make_db(root, [])
+    side = root / "profiles" / "side"
+    _make_db(side, [])
+    (side / "config.yaml").write_text("plugins:\n  entries:\n    herald-push:\n      settings:\n        enabled: false\n", encoding="utf-8")
+    assert watcher.profile_enabled(side) is False
+    assert watcher.profile_enabled(root) is True
+    monkeypatch.setattr(watcher, "bot_chat_tip", lambda home: "s1" if (home / "state.db").exists() else None)
+    sent = []
+    monkeypatch.setattr(push, "publish", lambda device, payload, sig, client=None: sent.append(payload["bot"]) or True)
+    store = Store(tmp_path / "data")
+    store.upsert(Device.parse(phone()[0]))
+    w = watcher.Watcher(root, store, now=lambda: now)
+    w.poll()
+    _add(root, ("s1", "assistant", "from main", None, 1, None, now))
+    _add(side, ("s1", "assistant", "from side", None, 1, None, now))
+    assert w.poll() == 1
+    assert sent == ["default"]
+
+
+def test_marks_are_saved_on_push_or_every_so_often(tmp_path, monkeypatch):
+    clock = {"now": 1_800_000_000.0}
+    root = tmp_path / "hermes"
+    _make_db(root, [])
+    monkeypatch.setattr(watcher, "bot_chat_tip", lambda home: "s1" if (home / "state.db").exists() else None)
+    monkeypatch.setattr(push, "publish", lambda *a, **k: True)
+    store = Store(tmp_path / "data")
+    store.upsert(Device.parse(phone()[0]))
+    saves = []
+    monkeypatch.setattr(store, "save_marks", lambda marks: saves.append(dict(marks)))
+    w = watcher.Watcher(root, store, now=lambda: clock["now"])
+    w.poll()
+    assert len(saves) == 1  # first sight
+    for _ in range(5):
+        _add(root, ("s1", "user", "typing…", None, 1, None, clock["now"]))
+        clock["now"] += 3
+        w.poll()
+    assert len(saves) == 1  # busy turn, nothing pushed: no fsync per poll
+    clock["now"] += watcher.MARKS_SAVE_SECONDS
+    w.poll()
+    assert len(saves) == 2  # and at most every so often
+    _add(root, ("s1", "assistant", "done", None, 1, None, clock["now"]))
+    assert w.poll() == 1
+    assert len(saves) == 3  # a push saves at once
 
 
 def _make_db(home, rows):

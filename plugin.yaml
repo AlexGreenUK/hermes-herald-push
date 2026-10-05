@@ -1,6 +1,6 @@
 name: herald-push
 label: Herald push
-version: 0.1.0
+version: 0.1.1
 manifest_version: 2
 requires_hermes: ">=0.21.5"
 description: >
@@ -16,4 +16,4 @@ config_schema:
     type: bool
     default: true
     label: Send notifications
-    description: Push new bot messages to registered phones.
+    description: Push this bot's new messages to the registered phones. Each bot (profile) has its own switch.

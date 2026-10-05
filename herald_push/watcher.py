@@ -24,21 +24,48 @@ from .store import Store
 
 log = logging.getLogger(__name__)
 
+PLUGIN_NAME = "herald-push"
 BOT_CHAT_TITLE = "Bot Chat"
 POLL_SECONDS = 3.0
 # After a restart, replies older than this are old news: don't push them.
 STALE_SECONDS = 15 * 60
 MAX_PER_POLL = 4
+# Where the watcher left off is written when a push went out, else at most this often: a lost mark costs
+# one duplicate the phone drops, so an fsync per poll during a busy turn isn't worth it.
+MARKS_SAVE_SECONDS = 30
 _SILENCE = {"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY", "[静默]", "静默", "[沉默]", "沉默"}
-_LONG_LIVED = ("dashboard", "serve", "gateway")
+_LONG_LIVED_MODULES = ("tui_gateway.server", "gateway.run")
 
 
-def is_long_lived_process(argv: Optional[List[str]] = None) -> bool:
-    """The dashboard or the messaging gateway; not a one-shot chat, cron run or CLI command."""
+def is_long_lived_process(argv: Optional[List[str]] = None, modules: Optional[Dict[str, object]] = None) -> bool:
+    """The dashboard or the messaging gateway; not a one-shot chat, cron run or CLI command.
+
+    Decided by what the process has loaded: plugins register lazily, so by then the dashboard
+    (``tui_gateway.server``) or the messaging gateway (``gateway.run``) is already imported. The
+    command line is only a fallback for launchers that import them later.
+    """
     args = [a.lower() for a in (argv if argv is not None else sys.argv)]
     if "-q" in args or "chat" in args:
         return False
-    return any(word in args for word in _LONG_LIVED) or any("tui_gateway" in a for a in args)
+    loaded = sys.modules if modules is None else modules
+    if any(name in loaded for name in _LONG_LIVED_MODULES):
+        return True
+    return "dashboard" in args or "serve" in args or ("gateway" in args and "run" in args)
+
+
+def profile_enabled(home: Path) -> bool:
+    """The bot's own "Send notifications" switch: ``plugins.entries.herald-push.settings.enabled`` in its
+    profile's config.yaml, where the Plugins hub writes it. Each bot's setting governs that bot's pushes."""
+    try:
+        import yaml
+        data = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+        entries = ((data.get("plugins") or {}).get("entries") or {}) if isinstance(data, dict) else {}
+        for key, entry in entries.items():
+            if str(key).rsplit("/", 1)[-1] == PLUGIN_NAME and isinstance(entry, dict):
+                return (entry.get("settings") or {}).get("enabled") is not False
+    except Exception:
+        pass
+    return True
 
 
 def is_silence(text: str) -> bool:
@@ -187,7 +214,7 @@ class _LeaderLock:
 
 
 class Watcher:
-    def __init__(self, root: Path, store: Store, enabled: Callable[[], bool] = lambda: True,
+    def __init__(self, root: Path, store: Store, enabled: Callable[[Path], bool] = profile_enabled,
                  now: Callable[[], float] = time.time):
         self.root = root
         self.store = store
@@ -197,6 +224,8 @@ class Watcher:
         self._thread: Optional[threading.Thread] = None
         self._lock = _LeaderLock(store.root / "leader.lock")
         self._marks: Dict[str, int] = {}
+        self._marks_dirty = False
+        self._marks_saved_at = 0.0
         self._tips: Dict[str, str] = {}
         # Per bot: the texts pushed lately and when, so a compression copy isn't pushed twice.
         self._pushed: Dict[str, Dict[str, float]] = {}
@@ -212,6 +241,11 @@ class Watcher:
         if self._thread is not None:
             self._thread.join(timeout=10)
         self._thread = None
+        if self._marks_dirty:
+            try:
+                self.store.save_marks(self._marks)
+            except OSError:
+                pass
         self._lock.release()
 
     def _run(self) -> None:
@@ -265,7 +299,7 @@ class Watcher:
                 pushed = self._pushed.get(profile, {})
                 fresh = [r for r in fresh if self.now() - pushed.get(r[2], -STALE_SECONDS * 2) > STALE_SECONDS]
             fresh = fresh[-MAX_PER_POLL:]
-            if not fresh or not devices or not self.enabled():
+            if not fresh or not devices or not self.enabled(home):
                 continue
             _, sig = self.store.identity()[1:]
             label = bot_label(home, profile)
@@ -282,5 +316,9 @@ class Watcher:
             # Drop marks of chats that are no longer anyone's tip.
             live = {f"{p}:{t}" for p, t in self._tips.items()}
             self._marks = {k: v for k, v in self._marks.items() if k in live}
+            self._marks_dirty = True
+        if self._marks_dirty and (sent or self.now() - self._marks_saved_at >= MARKS_SAVE_SECONDS):
             self.store.save_marks(self._marks)
+            self._marks_dirty = False
+            self._marks_saved_at = self.now()
         return sent

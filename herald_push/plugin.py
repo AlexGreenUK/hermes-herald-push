@@ -13,7 +13,7 @@ from .watcher import Watcher, is_long_lived_process
 
 log = logging.getLogger(__name__)
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # One watcher per process, however many profiles load the plugin.
 _watcher_lock = threading.Lock()
@@ -35,12 +35,6 @@ def register(ctx) -> None:
     root = _root()
     store = Store(root / "plugin-data" / "herald-push")
 
-    def enabled() -> bool:
-        try:
-            return ctx.get_config("enabled", True) is not False
-        except Exception:
-            return True
-
     def watching() -> bool:
         return _watcher is not None
 
@@ -52,7 +46,8 @@ def register(ctx) -> None:
         return
     with _watcher_lock:
         if _watcher is None:
-            _watcher = Watcher(root, store, enabled)
+            # One watcher for every profile; each bot's own "Send notifications" setting is read as it polls.
+            _watcher = Watcher(root, store)
             _watcher.start()
             log.info("herald-push: watching Bot Chats")
             started = _watcher
