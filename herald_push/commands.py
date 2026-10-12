@@ -10,15 +10,19 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from typing import Callable
+from typing import Callable, Optional
 
 from . import push
+from .phone import TOOLS, Phones
 from .store import InvalidRegistration, Device, Store
 
 log = logging.getLogger(__name__)
 
 MAX_ARG = 8192
-USAGE = "usage: /herald-push info | register <json> | unregister <device_id> | test <device_id>"
+# A phone tool's answer (a calendar, a contact list) is bigger than anything else sent here.
+MAX_ANSWER_ARG = 64000
+USAGE = ("usage: /herald-push info | register <json> | unregister <device_id> | test <device_id> | "
+         "phone tools <json> | phone pending <device_id> | phone answer <json>")
 
 
 def trusted_surface() -> bool:
@@ -35,8 +39,41 @@ def trusted_surface() -> bool:
         return False
 
 
+def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
+    """``phone tools <json>``: what this phone has switched on. ``phone pending <device_id>``: the tool calls
+    waiting for it. ``phone answer <json>``: the result of one."""
+    op, _, rest = raw.partition(" ")
+    rest = rest.strip()
+    if op == "pending":
+        return reply(ok=True, requests=phones.pending(rest))
+    try:
+        data = json.loads(rest)
+    except ValueError:
+        return reply(ok=False, error="not JSON")
+    if not isinstance(data, dict):
+        return reply(ok=False, error="not an object")
+    device_id = data.get("device_id")
+    if not isinstance(device_id, str):
+        return reply(ok=False, error="bad device_id")
+    if op == "tools":
+        tools = data.get("tools")
+        if not isinstance(tools, list):
+            return reply(ok=False, error="tools must be a list")
+        try:
+            return reply(ok=True, tools=phones.report(device_id, str(data.get("name") or ""), tools))
+        except ValueError as exc:
+            return reply(ok=False, error=str(exc))
+    if op == "answer":
+        error = data.get("error")
+        if error is not None and not isinstance(error, str):
+            return reply(ok=False, error="bad error")
+        return reply(ok=phones.answer(device_id, str(data.get("id") or ""), data.get("result"), error))
+    return reply(ok=False, error=USAGE)
+
+
 def make_handler(store: Store, version: str, watching: Callable[[], bool],
-                 trusted: Callable[[], bool] = trusted_surface) -> Callable[[str], str]:
+                 trusted: Callable[[], bool] = trusted_surface,
+                 phones: Optional[Phones] = None) -> Callable[[str], str]:
     def reply(**data) -> str:
         return json.dumps(data, separators=(",", ":"))
 
@@ -46,13 +83,15 @@ def make_handler(store: Store, version: str, watching: Callable[[], bool],
             if not trusted():
                 return reply(ok=False, error="Herald push can only be managed from the Herald app or the dashboard.")
             raw = (raw or "").strip()
-            if len(raw) > MAX_ARG:
+            if len(raw) > (MAX_ANSWER_ARG if raw.startswith("phone answer ") else MAX_ARG):
                 return reply(ok=False, error="too long")
             op, _, rest = raw.partition(" ")
             rest = rest.strip()
             if op in ("", "info"):
                 return reply(ok=True, version=version, gateway=store.public_identity(), watching=watching(),
-                             devices=len(store.devices()))
+                             devices=len(store.devices()), phone_tools=sorted(TOOLS))
+            if op == "phone" and phones is not None:
+                return phone_command(phones, rest, reply)
             if op == "register":
                 try:
                     device = Device.parse(json.loads(rest))

@@ -30,7 +30,24 @@ hermes plugins install https://github.com/Giton22/hermes-herald-push
 - **Storage.** The gateway identity and the device list are in `<hermes root>/plugin-data/herald-push/`, with
   file mode 0600.
 
-**Not in 0.1:** replying or approving through push. Those still use the direct connection.
+**Not yet:** replying or approving through push. Those still use the direct connection.
+
+## Phone tools (0.2)
+
+Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery`, `phone_network`,
+`phone_sound`, `phone_alarm`, `phone_screen_time`, `phone_open`, `phone_clipboard`, `phone_location`,
+`phone_geofence`, `phone_calendar`, `phone_contacts` and `phone_health`.
+
+- **Off until the user turns them on.** Each tool has its own switch in Herald (Settings → Phone tools). Herald
+  tells the gateway which ones are on with `/herald-push phone tools`, and a tool no phone has on is not
+  offered to the agent at all. Turning one off takes it away on the next turn, and refuses a call still waiting.
+- **Changes ask first.** Setting an alarm or Do Not Disturb, opening something, copying, adding or moving an
+  event and adding a watched place are shown on the phone, and only happen if the user allows them there.
+- **How a call travels.** The tool writes a request file to `<hermes root>/plugin-data/herald-push/phone/`
+  (files, because the agent can run in another process than the dashboard). Herald learns of it from the
+  chat's tool event, a push, or when it connects, reads it with `/herald-push phone pending` and answers with
+  `/herald-push phone answer`, both over the dashboard's authenticated connection only. Reads wait 30 seconds
+  for the phone, changes 2 minutes; then the agent is told the phone didn't answer.
 
 ## Tests
 
