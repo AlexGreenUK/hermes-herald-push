@@ -337,7 +337,10 @@ def test_phone_commands(tmp_path):
     reply = json.loads(handle("phone tools " + json.dumps({"device_id": PHONE, "key": KEY, "name": "Pixel",
                                                            "tools": ["phone_battery", "nope"]})))
     assert reply == {"ok": True, "tools": ["phone_battery"]}
-    assert json.loads(handle("phone pending " + json.dumps({"device_id": PHONE, "key": KEY}))) == {"ok": True, "requests": []}
+    pending = json.loads(handle("phone pending " + json.dumps({"device_id": PHONE, "key": KEY})))
+    assert pending["ok"] is True and pending["requests"] == []
+    # The gateway's time, so the phone can tell how long each call has left whatever its own clock says.
+    assert abs(pending["now"] - time.time()) < 5
     me = {"device_id": PHONE, "key": KEY}
     assert json.loads(handle("phone here " + json.dumps({**me, "sid": "abc123"}))) == {"ok": True}
     assert json.loads(handle("phone here " + json.dumps({**me, "sid": 5})))["ok"] is False

@@ -15,7 +15,7 @@ from .watcher import Watcher, is_long_lived_process
 
 log = logging.getLogger(__name__)
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 # One watcher per process, however many profiles load the plugin.
 _watcher_lock = threading.Lock()

@@ -88,7 +88,8 @@ def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
             return reply(ok=False, error="Remove another phone; turn phone tools off to take this one away.")
         return reply(ok=phones.remove(target), phones=phones.listing(device_id))
     if op == "pending":
-        return reply(ok=True, requests=phones.pending(device_id))
+        # The gateway's time too: the phone measures each call's ``expires`` against it, not its own clock.
+        return reply(ok=True, requests=phones.pending(device_id), now=int(phones.clock()))
     if op == "answer":
         error = data.get("error")
         if error is not None and not isinstance(error, str):

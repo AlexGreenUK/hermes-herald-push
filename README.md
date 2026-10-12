@@ -32,7 +32,7 @@ hermes plugins install https://github.com/Giton22/hermes-herald-push
 
 **Not yet:** replying or approving through push. Those still use the direct connection.
 
-## Phone tools (0.3.2)
+## Phone tools (0.3.3)
 
 Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery`, `phone_network`,
 `phone_sound`, `phone_alarm`, `phone_screen_time`, `phone_open`, `phone_clipboard`, `phone_location`,
