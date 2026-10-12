@@ -37,10 +37,21 @@ def test_only_known_tools_are_kept_and_offered(tmp_path):
     assert not phones.offered("phone_location")
 
 
-@pytest.mark.parametrize("device_id, key", [("../../etc", KEY), (PHONE, "short"), (PHONE, "Z" * 64)])
-def test_bad_ids_and_keys_are_refused(tmp_path, device_id, key):
+@pytest.mark.parametrize("device_id, key, push_id", [
+    ("../../etc", KEY, None), (PHONE, "short", None), (PHONE, "Z" * 64, None), (PHONE, KEY, "../x"),
+])
+def test_bad_ids_and_keys_are_refused(tmp_path, device_id, key, push_id):
     with pytest.raises(ValueError):
-        Phones(Store(tmp_path)).report(device_id, key, "x", ["phone_battery"])
+        Phones(Store(tmp_path)).report(device_id, key, "x", ["phone_battery"], push_id)
+
+
+def test_no_push_registration_no_nudge(tmp_path):
+    woken = []
+    phones = Phones(Store(tmp_path), wake=lambda d, r: woken.append((d, r)))
+    phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
+    answer_when_asked(phones, PHONE, result={})
+    phones.call("phone_battery", {})
+    assert woken == []
 
 
 def test_another_key_cant_take_over_a_phone(tmp_path):
@@ -78,10 +89,14 @@ def test_the_most_recent_phone_answers(tmp_path):
 def test_a_call_waits_for_the_phone_and_cleans_up(tmp_path):
     woken = []
     phones = Phones(Store(tmp_path), wake=lambda d, r: woken.append((d, r)))
-    phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
+    phones.report(PHONE, KEY, "Pixel", ["phone_battery"], push_id=OTHER)
     answer_when_asked(phones, PHONE, result={"level": 80})
     assert json.loads(phones.call("phone_battery", {}, "s1")) == {"level": 80}
-    assert woken and woken[0][0] == PHONE
+    # The nudge goes to the phone's push registration.
+    deadline = time.time() + 2
+    while not woken and time.time() < deadline:
+        time.sleep(0.02)
+    assert woken and woken[0][0] == OTHER
     assert list((tmp_path / "phone").glob("*.req.json")) == []
     assert list((tmp_path / "phone").glob("*.res.json")) == []
 

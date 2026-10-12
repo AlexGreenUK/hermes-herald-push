@@ -57,8 +57,11 @@ def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
         tools = data.get("tools")
         if not isinstance(tools, list):
             return reply(ok=False, error="tools must be a list")
+        push_id = data.get("push_id")
+        if push_id is not None and not isinstance(push_id, str):
+            return reply(ok=False, error="bad push_id")
         try:
-            return reply(ok=True, tools=phones.report(device_id, key, str(data.get("name") or ""), tools))
+            return reply(ok=True, tools=phones.report(device_id, key, str(data.get("name") or ""), tools, push_id))
         except ValueError as exc:
             return reply(ok=False, error=str(exc))
     if not phones.verify(device_id, key):

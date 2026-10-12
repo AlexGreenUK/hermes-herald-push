@@ -211,13 +211,16 @@ class Phones:
         known = self._phones().get(device_id, {}).get("key")
         return isinstance(known, str) and hmac.compare_digest(known, self._hash(key))
 
-    def report(self, device_id: str, key: str, name: str, tools: List[str]) -> List[str]:
+    def report(self, device_id: str, key: str, name: str, tools: List[str], push_id: Optional[str] = None) -> List[str]:
         """Records what [device_id] has switched on (only tools this plugin knows); returns those. The first
-        report binds the phone id to [key]; a later one with another key is refused."""
+        report binds the phone id to [key]; a later one with another key is refused. [push_id] is the phone's
+        push registration, if any, which a call nudges; it only ever receives a nudge, never the call."""
         if not DEVICE_ID_RE.match(device_id or ""):
             raise ValueError("bad device_id")
         if not KEY_RE.match(key or ""):
             raise ValueError("bad key")
+        if push_id is not None and not DEVICE_ID_RE.match(push_id):
+            raise ValueError("bad push_id")
         kept = sorted({t for t in tools if isinstance(t, str) and t in TOOLS})
         clean = "".join(ch for ch in str(name or "") if ch.isprintable())[:MAX_NAME].strip() or "Phone"
         with self.store._lock():
@@ -226,7 +229,8 @@ class Phones:
             if isinstance(known, str) and not hmac.compare_digest(known, self._hash(key)):
                 raise ValueError("this phone id is held by another key")
             # Kept with no tools too: the key stays bound to the id.
-            phones[device_id] = {"name": clean, "tools": kept, "seen": int(self.clock()), "key": self._hash(key)}
+            phones[device_id] = {"name": clean, "tools": kept, "seen": int(self.clock()), "key": self._hash(key),
+                                 "push": push_id}
             _write_private(self.root / "phones.json", phones)
         _refresh_tool_list()
         # What is still waiting for a tool that's off now is refused.
@@ -261,9 +265,10 @@ class Phones:
         request = {"id": request_id, "device_id": device_id, "tool": tool, "args": args if isinstance(args, dict) else {},
                    "session": str(session_id or ""), "created": int(now), "expires": int(now + timeout)}
         _write_private(self._path(request_id, "req"), request)
-        if self.wake is not None:
+        push_id = self._phones().get(device_id, {}).get("push")
+        if self.wake is not None and isinstance(push_id, str):
             # The push goes out beside the wait: ntfy may take seconds, and the phone may already be listening.
-            threading.Thread(target=self._wake, args=(device_id, request_id), daemon=True).start()
+            threading.Thread(target=self._wake, args=(push_id, request_id), daemon=True).start()
         try:
             deadline = now + timeout
             while self.clock() < deadline:
@@ -281,9 +286,9 @@ class Phones:
             for kind in ("req", "res"):
                 _unlink(self._path(request_id, kind))
 
-    def _wake(self, device_id: str, request_id: str) -> None:
+    def _wake(self, push_id: str, request_id: str) -> None:
         try:
-            self.wake(device_id, request_id)
+            self.wake(push_id, request_id)
         except Exception:
             log.warning("herald-push: couldn't wake the phone for a tool", exc_info=True)
 
