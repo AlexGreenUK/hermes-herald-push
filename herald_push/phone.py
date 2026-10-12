@@ -47,6 +47,13 @@ REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 KEY_RE = re.compile(r"^[0-9a-f]{32,128}$")
 # How often each process looks whether a phone changed its tools, to refresh its tool list.
 WATCH_SECONDS = 2.0
+# Which phone sent a chat's messages is kept this long, for at most this many chat connections.
+HERE_SECONDS = 3 * 24 * 3600
+MAX_HERE = 500
+# A turn with no chat connection (a side question, a background task) goes to a phone that sent this recently.
+JUST_SENT_SECONDS = 120
+# A chat connection id from the gateway (``HERMES_UI_SESSION_ID``): short, plain characters only.
+SID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 # How long the agent waits. Reads answer at once; a change waits for you to allow it on the phone.
 READ_TIMEOUT = 30
@@ -229,8 +236,10 @@ class Phones:
             if isinstance(known, str) and not hmac.compare_digest(known, self._hash(key)):
                 raise ValueError("this phone id is held by another key")
             # Kept with no tools too: the key stays bound to the id.
-            phones[device_id] = {"name": clean, "tools": kept, "seen": int(self.clock()), "key": self._hash(key),
-                                 "push": push_id}
+            entry = {"name": clean, "tools": kept, "seen": int(self.clock()), "key": self._hash(key), "push": push_id}
+            if phones.get(device_id, {}).get("default"):
+                entry["default"] = True
+            phones[device_id] = entry
             _write_private(self.root / "phones.json", phones)
         _refresh_tool_list()
         # What is still waiting for a tool that's off now is refused.
@@ -239,26 +248,99 @@ class Phones:
                 self.answer(device_id, request["id"], None, "The user turned this tool off on the phone.")
         return kept
 
-    def phone_for(self, tool: str) -> Optional[str]:
-        """The phone that offers [tool], the most recently heard from first."""
+    # ── which phone a call goes to ──────────────────────────────────────────
+
+    def _here(self) -> dict:
+        raw = self._read(self.root / "here.json") or {}
+        sids = raw.get("sids") if isinstance(raw.get("sids"), dict) else {}
+        used = raw.get("used") if isinstance(raw.get("used"), dict) else {}
+        return {"sids": sids, "used": used}
+
+    def here(self, device_id: str, sid: str) -> bool:
+        """[device_id] sends messages on chat connection [sid]: calls from turns there go to it. Kept apart from
+        ``phones.json``, whose every change makes each process build its tool list again."""
+        if not SID_RE.match(sid or ""):
+            return False
+        now = int(self.clock())
+        with self.store._lock():
+            here = self._here()
+            sids = {k: v for k, v in here["sids"].items()
+                    if isinstance(v, dict) and now - int(v.get("at", 0)) < HERE_SECONDS}
+            sids[sid] = {"device": device_id, "at": now}
+            if len(sids) > MAX_HERE:
+                sids = dict(sorted(sids.items(), key=lambda kv: int(kv[1].get("at", 0)))[-MAX_HERE:])
+            used = {k: v for k, v in here["used"].items() if k in self._phones()}
+            used[device_id] = now
+            _write_private(self.root / "here.json", {"sids": sids, "used": used})
+        return True
+
+    def set_default(self, device_id: str, on: bool) -> bool:
+        """Makes [device_id] the phone for calls no phone's message started (a cron job, Desktop, the
+        dashboard), or stops it being that. One phone at a time."""
+        with self.store._lock():
+            phones = self._phones()
+            if device_id not in phones:
+                return False
+            for k, v in phones.items():
+                if k == device_id:
+                    v["default"] = bool(on)
+                elif on:
+                    v.pop("default", None)
+            _write_private(self.root / "phones.json", phones)
+        return True
+
+    def is_default(self, device_id: str) -> bool:
+        return bool(self._phones().get(device_id, {}).get("default"))
+
+    def route(self, tool: str, sid: str = "") -> tuple:
+        """``(phone, refusal)`` for a call of [tool] from a turn on chat connection [sid]:
+        the phone that sent that turn's message; else a phone that sent a turn in the last two minutes; else the
+        default phone; else the phone used last.
+        The phone that sent the message decides alone: with the tool off there, no other phone is asked."""
         now = self.clock()
-        offering = [(int(v.get("seen", 0)), k) for k, v in self._phones().items()
-                    if tool in (v.get("tools") or []) and now - int(v.get("seen", 0)) < STALE_SECONDS]
-        return max(offering)[1] if offering else None
+        phones = {k: v for k, v in self._phones().items() if now - int(v.get("seen", 0)) < STALE_SECONDS}
+
+        def offers(device_id: Optional[str]) -> bool:
+            return device_id in phones and tool in (phones[device_id].get("tools") or [])
+
+        here = self._here()
+        sender = (here["sids"].get(sid) or {}).get("device") if sid else None
+        if sender in phones:
+            if offers(sender):
+                return sender, None
+            return None, f"The phone this message came from ({phones[sender].get('name') or 'Phone'}) has this tool off."
+        offering = [(int(here["used"].get(k, 0)), int(v.get("seen", 0)), k) for k, v in phones.items() if offers(k)]
+        # A side question or background task (/btw, /bg) runs without its chat connection: the phone that sent
+        # a turn moments ago is the one that asked.
+        latest = max(offering) if offering else None
+        if latest is not None and now - latest[0] < JUST_SENT_SECONDS:
+            return latest[2], None
+        default = next((k for k, v in phones.items() if v.get("default")), None)
+        if offers(default):
+            return default, None
+        return (latest[2], None) if latest else (None, "No phone offers this tool any more.")
+
+    def phone_for(self, tool: str, sid: str = "") -> Optional[str]:
+        """The phone a call of [tool] from chat connection [sid] goes to, or None."""
+        return self.route(tool, sid)[0]
 
     def offered(self, tool: str) -> bool:
-        return self.phone_for(tool) is not None
+        """Whether any phone has [tool] on: what the agent is offered."""
+        now = self.clock()
+        return any(tool in (v.get("tools") or []) and now - int(v.get("seen", 0)) < STALE_SECONDS
+                   for v in self._phones().values())
 
     # ── requests ────────────────────────────────────────────────────────────
 
     def _path(self, request_id: str, kind: str) -> Path:
         return self.root / f"{request_id}.{kind}.json"
 
-    def call(self, tool: str, args: dict, session_id: str = "") -> str:
-        """Runs [tool] on a phone and waits for its answer: the tool result the agent reads, as JSON."""
-        device_id = self.phone_for(tool)
+    def call(self, tool: str, args: dict, session_id: str = "", sid: str = "") -> str:
+        """Runs [tool] on a phone and waits for its answer: the tool result the agent reads, as JSON. [sid] is
+        the chat connection whose turn calls it, which picks the phone (see [route])."""
+        device_id, refusal = self.route(tool, sid)
         if device_id is None:
-            return _error("No phone offers this tool any more.")
+            return _error(refusal or "No phone offers this tool any more.")
         timeout = TOOLS[tool][1]
         request_id = uuid.uuid4().hex
         now = self.clock()
@@ -402,6 +484,19 @@ def on_messaging_platform() -> bool:
         return False
 
 
+def turn_connection() -> str:
+    """The chat connection whose message started this turn (the dashboard's session id), or "" for a turn no
+    one sent: a cron job, a background task, an older Hermes."""
+    try:
+        from gateway.session_context import get_session_env
+    except ImportError:
+        return ""
+    try:
+        return str(get_session_env("HERMES_UI_SESSION_ID", "") or "")
+    except Exception:
+        return ""
+
+
 class _Watch(threading.Thread):
     """Refreshes this process's tool list when another process records a phone's switches."""
 
@@ -444,7 +539,7 @@ def register_tools(ctx, phones: Phones) -> None:
             if on_messaging_platform():
                 return _error("Phone tools only work in chats from Herald, Desktop or the dashboard, not on a "
                               "messaging platform.")
-            return phones.call(_name, args, session_id)
+            return phones.call(_name, args, session_id, turn_connection())
 
         def check(_name=name) -> bool:
             return phones.offered(_name)

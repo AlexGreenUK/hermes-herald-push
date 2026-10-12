@@ -22,7 +22,8 @@ MAX_ARG = 8192
 # A phone tool's answer (a calendar, a contact list) is bigger than anything else sent here.
 MAX_ANSWER_ARG = 64000
 USAGE = ("usage: /herald-push info | register <json> | unregister <device_id> | test <device_id> | "
-         "phone tools <json> | phone pending <json> | phone answer <json>")
+         "phone tools <json> | phone pending <json> | phone answer <json> | phone here <json> | "
+         "phone default <json>")
 
 
 def trusted_surface() -> bool:
@@ -41,8 +42,10 @@ def trusted_surface() -> bool:
 
 def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
     """``phone tools <json>``: what this phone has switched on. ``phone pending <json>``: the tool calls
-    waiting for it. ``phone answer <json>``: the result of one. Each carries the phone's ``device_id`` and
-    secret ``key``."""
+    waiting for it. ``phone answer <json>``: the result of one. ``phone here <json>``: this phone sends messages
+    on chat connection ``sid``, so calls from those turns come to it. ``phone default <json>``: whether calls no
+    phone's message started (cron jobs) come to this phone. Each carries the phone's ``device_id`` and secret
+    ``key``."""
     op, _, rest = raw.partition(" ")
     try:
         data = json.loads(rest.strip())
@@ -61,11 +64,22 @@ def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
         if push_id is not None and not isinstance(push_id, str):
             return reply(ok=False, error="bad push_id")
         try:
-            return reply(ok=True, tools=phones.report(device_id, key, str(data.get("name") or ""), tools, push_id))
+            kept = phones.report(device_id, key, str(data.get("name") or ""), tools, push_id)
         except ValueError as exc:
             return reply(ok=False, error=str(exc))
+        return reply(ok=True, tools=kept, default=phones.is_default(device_id))
     if not phones.verify(device_id, key):
         return reply(ok=False, error="unknown phone")
+    if op == "here":
+        sid = data.get("sid")
+        if not isinstance(sid, str):
+            return reply(ok=False, error="bad sid")
+        return reply(ok=phones.here(device_id, sid))
+    if op == "default":
+        on = data.get("on")
+        if not isinstance(on, bool):
+            return reply(ok=False, error="on must be true or false")
+        return reply(ok=phones.set_default(device_id, on), default=phones.is_default(device_id))
     if op == "pending":
         return reply(ok=True, requests=phones.pending(device_id))
     if op == "answer":

@@ -86,6 +86,80 @@ def test_the_most_recent_phone_answers(tmp_path):
     assert phones.phone_for("phone_battery") == OTHER
 
 
+def test_a_call_goes_to_the_phone_that_sent_the_message(tmp_path):
+    now = [1_000_000.0]
+    phones = Phones(Store(tmp_path), clock=lambda: now[0])
+    phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
+    phones.report(OTHER, OTHER_KEY, "Tablet", ["phone_battery"])
+    assert phones.here(PHONE, "sid-pixel")
+    now[0] += 10
+    assert phones.here(OTHER, "sid-tablet")
+    # Reported or used later, the other phone doesn't take the Pixel's chat.
+    phones.report(OTHER, OTHER_KEY, "Tablet", ["phone_battery"])
+    assert phones.phone_for("phone_battery", "sid-pixel") == PHONE
+    assert phones.phone_for("phone_battery", "sid-tablet") == OTHER
+
+
+def test_the_sending_phone_with_the_tool_off_isnt_passed_over(tmp_path):
+    phones = Phones(Store(tmp_path))
+    phones.report(PHONE, KEY, "Pixel", [])
+    phones.report(OTHER, OTHER_KEY, "Tablet", ["phone_location"])
+    phones.here(PHONE, "sid-pixel")
+    device, refusal = phones.route("phone_location", "sid-pixel")
+    assert device is None and "Pixel" in refusal
+    assert json.loads(phones.call("phone_location", {}, sid="sid-pixel"))["error"] == refusal
+
+
+def test_a_turn_no_phone_sent_goes_to_the_default_phone(tmp_path):
+    now = [1_000_000.0]
+    phones = Phones(Store(tmp_path), clock=lambda: now[0])
+    phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
+    phones.report(OTHER, OTHER_KEY, "Tablet", ["phone_battery"])
+    phones.here(PHONE, "sid-pixel")
+    now[0] += 10
+    phones.here(OTHER, "sid-tablet")
+    # No default: the phone used last. A cron job has no chat connection; Desktop's isn't a phone's.
+    assert phones.phone_for("phone_battery") == OTHER
+    assert phones.phone_for("phone_battery", "sid-desktop") == OTHER
+    assert phones.set_default(PHONE, True)
+    # A side question just sent from the Tablet has no connection either: it still goes there.
+    assert phones.phone_for("phone_battery") == OTHER
+    now[0] += phone.JUST_SENT_SECONDS
+    assert phones.phone_for("phone_battery") == PHONE
+    # One default at a time, kept across reports.
+    assert phones.set_default(OTHER, True)
+    phones.report(OTHER, OTHER_KEY, "Tablet", ["phone_battery"])
+    assert phones.is_default(OTHER) and not phones.is_default(PHONE)
+    # A default with the tool off: the next phone that has it.
+    phones.report(OTHER, OTHER_KEY, "Tablet", [])
+    assert phones.phone_for("phone_battery") == PHONE
+    phones.set_default(OTHER, False)
+    assert not phones.is_default(OTHER)
+
+
+def test_bad_connection_ids_are_refused(tmp_path):
+    phones = Phones(Store(tmp_path))
+    phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
+    assert not phones.here(PHONE, "")
+    assert not phones.here(PHONE, "../x y")
+    assert not phones.here(PHONE, "x" * 200)
+    assert not phones.set_default(OTHER, True)
+
+
+def test_old_connections_are_forgotten(tmp_path, monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(phone, "MAX_HERE", 3)
+    phones = Phones(Store(tmp_path), clock=lambda: now[0])
+    phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
+    for i in range(5):
+        now[0] += 1
+        phones.here(PHONE, f"sid-{i}")
+    assert sorted(phones._here()["sids"]) == ["sid-2", "sid-3", "sid-4"]
+    now[0] += phone.HERE_SECONDS + 1
+    phones.here(PHONE, "sid-new")
+    assert list(phones._here()["sids"]) == ["sid-new"]
+
+
 def test_a_call_waits_for_the_phone_and_cleans_up(tmp_path):
     woken = []
     phones = Phones(Store(tmp_path), wake=lambda d, r: woken.append((d, r)))
@@ -216,8 +290,14 @@ def test_phone_commands(tmp_path):
     handle, _ = handler_for(tmp_path)
     reply = json.loads(handle("phone tools " + json.dumps({"device_id": PHONE, "key": KEY, "name": "Pixel",
                                                            "tools": ["phone_battery", "nope"]})))
-    assert reply == {"ok": True, "tools": ["phone_battery"]}
+    assert reply == {"ok": True, "tools": ["phone_battery"], "default": False}
     assert json.loads(handle("phone pending " + json.dumps({"device_id": PHONE, "key": KEY}))) == {"ok": True, "requests": []}
+    me = {"device_id": PHONE, "key": KEY}
+    assert json.loads(handle("phone here " + json.dumps({**me, "sid": "abc123"}))) == {"ok": True}
+    assert json.loads(handle("phone here " + json.dumps({**me, "sid": 5})))["ok"] is False
+    assert json.loads(handle("phone default " + json.dumps({**me, "on": True}))) == {"ok": True, "default": True}
+    assert json.loads(handle("phone default " + json.dumps({**me, "on": "yes"})))["ok"] is False
+    assert json.loads(handle("phone tools " + json.dumps({**me, "tools": []})))["default"] is True
     assert json.loads(handle("phone answer {"))["ok"] is False
     answer = {"device_id": PHONE, "key": KEY, "id": "0" * 32}
     assert json.loads(handle("phone answer " + json.dumps(answer)))["ok"] is False
@@ -227,8 +307,9 @@ def test_phone_commands(tmp_path):
 def test_phone_commands_need_the_phones_key(tmp_path):
     handle, phones = handler_for(tmp_path)
     phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
-    for op in ("pending", "answer"):
-        reply = json.loads(handle(f"phone {op} " + json.dumps({"device_id": PHONE, "key": OTHER_KEY, "id": "0" * 32})))
+    for op in ("pending", "answer", "here", "default"):
+        reply = json.loads(handle(f"phone {op} " + json.dumps({"device_id": PHONE, "key": OTHER_KEY, "id": "0" * 32,
+                                                              "sid": "abc", "on": True})))
         assert reply == {"ok": False, "error": "unknown phone"}
     taken = json.loads(handle("phone tools " + json.dumps({"device_id": PHONE, "key": OTHER_KEY, "tools": []})))
     assert taken["ok"] is False and phones.offered("phone_battery")
@@ -279,6 +360,17 @@ def test_tools_are_offered_only_while_a_phone_has_them_on(tmp_path, ctx):
     answer_when_asked(phones, PHONE, result={"level": 5})
     # The dispatcher passes context kwargs the handler doesn't use.
     assert json.loads(handler({}, session_id="s", task_id="t", user_task="u")) == {"level": 5}
+
+
+def test_the_handler_routes_by_the_turns_chat_connection(tmp_path, ctx, monkeypatch):
+    monkeypatch.setattr(phone, "turn_connection", lambda: "sid-pixel")
+    phones = Phones(Store(tmp_path))
+    phone.register_tools(ctx, phones)
+    phones.report(PHONE, KEY, "Pixel", ["phone_battery"])
+    phones.report(OTHER, OTHER_KEY, "Tablet", ["phone_battery"])
+    phones.here(PHONE, "sid-pixel")
+    answer_when_asked(phones, PHONE, result={"level": 7})
+    assert json.loads(ctx.tools["phone_battery"][0]({})) == {"level": 7}
 
 
 def test_messaging_platforms_get_no_phone_tools(tmp_path, ctx, monkeypatch):
