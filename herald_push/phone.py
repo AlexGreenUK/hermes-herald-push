@@ -237,8 +237,9 @@ class Phones:
                 raise ValueError("this phone id is held by another key")
             # Kept with no tools too: the key stays bound to the id.
             entry = {"name": clean, "tools": kept, "seen": int(self.clock()), "key": self._hash(key), "push": push_id}
-            if phones.get(device_id, {}).get("default"):
-                entry["default"] = True
+            rank = phones.get(device_id, {}).get("rank")
+            if isinstance(rank, int):
+                entry["rank"] = rank
             phones[device_id] = entry
             _write_private(self.root / "phones.json", phones)
         _refresh_tool_list()
@@ -274,28 +275,56 @@ class Phones:
             _write_private(self.root / "here.json", {"sids": sids, "used": used})
         return True
 
-    def set_default(self, device_id: str, on: bool) -> bool:
-        """Makes [device_id] the phone for calls no phone's message started (a cron job, Desktop, the
-        dashboard), or stops it being that. One phone at a time."""
+    def _ordered(self, phones: Dict[str, dict], used: dict) -> List[str]:
+        """[phones] in the user's order: those placed first, then the rest by last use, then last report."""
+        return sorted(phones, key=lambda k: (
+            phones[k].get("rank") if isinstance(phones[k].get("rank"), int) else MAX_HERE,
+            -int(used.get(k, 0)), -int(phones[k].get("seen", 0)), k))
+
+    def listing(self, me: str) -> List[dict]:
+        """Every phone the gateway knows, in the order calls no phone started try them; [me] is marked. Ids, names
+        and switches only: never another phone's key or push registration."""
+        phones = self._phones()
+        used = self._here()["used"]
+        return [{"id": k, "name": phones[k].get("name") or "Phone", "tools": phones[k].get("tools") or [],
+                 "seen": int(phones[k].get("seen", 0)), "used": int(used.get(k, 0)), "me": k == me}
+                for k in self._ordered(phones, used)]
+
+    def order(self, ids: List[str]) -> bool:
+        """Puts the phones [ids] first, in that order; the others follow by last use."""
+        if not all(isinstance(i, str) for i in ids):
+            return False
+        with self.store._lock():
+            phones = self._phones()
+            for v in phones.values():
+                v.pop("rank", None)
+            for rank, device_id in enumerate(i for i in dict.fromkeys(ids) if i in phones):
+                phones[device_id]["rank"] = rank
+            _write_private(self.root / "phones.json", phones)
+        return True
+
+    def remove(self, device_id: str) -> bool:
+        """Forgets [device_id]: a phone the user doesn't have any more. Its key goes with it; if it's still in
+        use, its next report adds it again as new."""
         with self.store._lock():
             phones = self._phones()
             if device_id not in phones:
                 return False
-            for k, v in phones.items():
-                if k == device_id:
-                    v["default"] = bool(on)
-                elif on:
-                    v.pop("default", None)
+            del phones[device_id]
             _write_private(self.root / "phones.json", phones)
+            here = self._here()
+            sids = {k: v for k, v in here["sids"].items() if isinstance(v, dict) and v.get("device") != device_id}
+            used = {k: v for k, v in here["used"].items() if k != device_id}
+            _write_private(self.root / "here.json", {"sids": sids, "used": used})
+        _refresh_tool_list()
+        for request in self.pending(device_id):
+            self.answer(device_id, request["id"], None, "The user removed that phone.")
         return True
-
-    def is_default(self, device_id: str) -> bool:
-        return bool(self._phones().get(device_id, {}).get("default"))
 
     def route(self, tool: str, sid: str = "") -> tuple:
         """``(phone, refusal)`` for a call of [tool] from a turn on chat connection [sid]:
         the phone that sent that turn's message; else a phone that sent a turn in the last two minutes; else the
-        default phone; else the phone used last.
+        first phone in the user's order that has the tool on.
         The phone that sent the message decides alone: with the tool off there, no other phone is asked."""
         now = self.clock()
         phones = {k: v for k, v in self._phones().items() if now - int(v.get("seen", 0)) < STALE_SECONDS}
@@ -315,10 +344,8 @@ class Phones:
         latest = max(offering) if offering else None
         if latest is not None and now - latest[0] < JUST_SENT_SECONDS:
             return latest[2], None
-        default = next((k for k, v in phones.items() if v.get("default")), None)
-        if offers(default):
-            return default, None
-        return (latest[2], None) if latest else (None, "No phone offers this tool any more.")
+        first = next((k for k in self._ordered(phones, here["used"]) if offers(k)), None)
+        return (first, None) if first else (None, "No phone offers this tool any more.")
 
     def phone_for(self, tool: str, sid: str = "") -> Optional[str]:
         """The phone a call of [tool] from chat connection [sid] goes to, or None."""
@@ -347,7 +374,13 @@ class Phones:
         request = {"id": request_id, "device_id": device_id, "tool": tool, "args": args if isinstance(args, dict) else {},
                    "session": str(session_id or ""), "created": int(now), "expires": int(now + timeout)}
         _write_private(self._path(request_id, "req"), request)
-        push_id = self._phones().get(device_id, {}).get("push")
+        # Read after writing: a remove that ran in between has either seen this request (and answers it) or
+        # is seen here; either way the call doesn't wait out its timeout for a phone that's gone.
+        phone = self._phones().get(device_id)
+        if phone is None and self._read(self._path(request_id, "res")) is None:
+            self._path(request_id, "req").unlink(missing_ok=True)
+            return _error("The user removed that phone.")
+        push_id = (phone or {}).get("push")
         if self.wake is not None and isinstance(push_id, str):
             # The push goes out beside the wait: ntfy may take seconds, and the phone may already be listening.
             threading.Thread(target=self._wake, args=(push_id, request_id), daemon=True).start()

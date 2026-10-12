@@ -32,7 +32,7 @@ hermes plugins install https://github.com/Giton22/hermes-herald-push
 
 **Not yet:** replying or approving through push. Those still use the direct connection.
 
-## Phone tools (0.3.0)
+## Phone tools (0.3.1)
 
 Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery`, `phone_network`,
 `phone_sound`, `phone_alarm`, `phone_screen_time`, `phone_open`, `phone_clipboard`, `phone_location`,
@@ -51,8 +51,10 @@ Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery
   phone has the same tool on. If that phone has the tool off, the call is refused rather than sent to another
   phone. A turn without a chat connection (a side question or background task, which Hermes runs apart from
   the chat) goes to a phone that sent a turn in the last two minutes. Any other turn no phone started (a cron
-  job, Desktop, the dashboard) goes to the phone the user chose for that in Herald
-  (`/herald-push phone default`), else to the phone used last.
+  job, Desktop, the dashboard) goes to the first phone, in the order the user set in Herald, that has the tool
+  on; phones not placed follow by last use. Herald lists the phones (`/herald-push phone list`), orders them
+  (`phone order`) and removes one the user doesn't have any more (`phone remove`); the list shows names and
+  switches, never another phone's key or push registration.
 - **Changes ask first.** Setting an alarm or Do Not Disturb, opening something, copying, adding or moving an
   event and adding a watched place are shown on the phone, and only happen if the user allows them there.
 - **How a call travels.** The tool writes a request file to `<hermes root>/plugin-data/herald-push/phone/`
