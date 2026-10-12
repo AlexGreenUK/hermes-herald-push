@@ -22,7 +22,7 @@ MAX_ARG = 8192
 # A phone tool's answer (a calendar, a contact list) is bigger than anything else sent here.
 MAX_ANSWER_ARG = 64000
 USAGE = ("usage: /herald-push info | register <json> | unregister <device_id> | test <device_id> | "
-         "phone tools <json> | phone pending <device_id> | phone answer <json>")
+         "phone tools <json> | phone pending <json> | phone answer <json>")
 
 
 def trusted_surface() -> bool:
@@ -40,29 +40,31 @@ def trusted_surface() -> bool:
 
 
 def phone_command(phones: Phones, raw: str, reply: Callable[..., str]) -> str:
-    """``phone tools <json>``: what this phone has switched on. ``phone pending <device_id>``: the tool calls
-    waiting for it. ``phone answer <json>``: the result of one."""
+    """``phone tools <json>``: what this phone has switched on. ``phone pending <json>``: the tool calls
+    waiting for it. ``phone answer <json>``: the result of one. Each carries the phone's ``device_id`` and
+    secret ``key``."""
     op, _, rest = raw.partition(" ")
-    rest = rest.strip()
-    if op == "pending":
-        return reply(ok=True, requests=phones.pending(rest))
     try:
-        data = json.loads(rest)
+        data = json.loads(rest.strip())
     except ValueError:
         return reply(ok=False, error="not JSON")
     if not isinstance(data, dict):
         return reply(ok=False, error="not an object")
-    device_id = data.get("device_id")
-    if not isinstance(device_id, str):
-        return reply(ok=False, error="bad device_id")
+    device_id, key = data.get("device_id"), data.get("key")
+    if not isinstance(device_id, str) or not isinstance(key, str):
+        return reply(ok=False, error="bad device_id or key")
     if op == "tools":
         tools = data.get("tools")
         if not isinstance(tools, list):
             return reply(ok=False, error="tools must be a list")
         try:
-            return reply(ok=True, tools=phones.report(device_id, str(data.get("name") or ""), tools))
+            return reply(ok=True, tools=phones.report(device_id, key, str(data.get("name") or ""), tools))
         except ValueError as exc:
             return reply(ok=False, error=str(exc))
+    if not phones.verify(device_id, key):
+        return reply(ok=False, error="unknown phone")
+    if op == "pending":
+        return reply(ok=True, requests=phones.pending(device_id))
     if op == "answer":
         error = data.get("error")
         if error is not None and not isinstance(error, str):

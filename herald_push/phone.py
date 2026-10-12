@@ -1,18 +1,25 @@
 """Phone tools: agent tools that run on a phone with Herald.
 
 The tools are a fixed list, reviewed here. A tool is offered to the agent only while a phone says it has it
-switched on (``/herald-push phone tools``); every tool starts off on the phone, and a phone that turns one off
-takes it away from the agent on the next turn.
+switched on (``/herald-push phone tools``); every tool starts off on the phone. Hermes fixes a chat's tools
+when the chat starts, so a switch changes what new chats are offered; a chat that already has a tool the
+user since turned off gets a refusal when it calls it.
 
 A call is a request file in ``<data>/phone/``. The phone learns about it from the agent's tool event (when
 it watches that chat), from a push (when it registered for push), or when it connects, reads it with
 ``/herald-push phone pending`` and answers with ``/herald-push phone answer``. The tool waits for the answer
 file, and after its timeout tells the agent the phone didn't answer. Files, not memory: the agent can run in
 another process (turn isolation, cron, the messaging gateway) than the dashboard the phone talks to.
+
+Each phone holds a secret key; the gateway keeps only its hash, and every phone command must carry the key,
+so one dashboard client can't read or answer another phone's calls. Phone tools refuse turns on messaging
+platforms: someone in a group chat with the bot must not get the owner's location or contacts.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -37,6 +44,9 @@ LEFTOVER_SECONDS = 3600
 MAX_RESULT = 60000
 MAX_NAME = 64
 REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+KEY_RE = re.compile(r"^[0-9a-f]{32,128}$")
+# How often each process looks whether a phone changed its tools, to refresh its tool list.
+WATCH_SECONDS = 2.0
 
 # How long the agent waits. Reads answer at once; a change waits for you to allow it on the phone.
 READ_TIMEOUT = 30
@@ -190,29 +200,45 @@ class Phones:
             return {}
         return {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
 
-    def report(self, device_id: str, name: str, tools: List[str]) -> List[str]:
-        """Records what [device_id] has switched on (only tools this plugin knows); returns those."""
+    @staticmethod
+    def _hash(key: str) -> str:
+        return hashlib.sha256(key.encode("ascii")).hexdigest()
+
+    def verify(self, device_id: str, key: str) -> bool:
+        """Whether [key] is the secret [device_id] reported with."""
+        if not DEVICE_ID_RE.match(device_id or "") or not KEY_RE.match(key or ""):
+            return False
+        known = self._phones().get(device_id, {}).get("key")
+        return isinstance(known, str) and hmac.compare_digest(known, self._hash(key))
+
+    def report(self, device_id: str, key: str, name: str, tools: List[str]) -> List[str]:
+        """Records what [device_id] has switched on (only tools this plugin knows); returns those. The first
+        report binds the phone id to [key]; a later one with another key is refused."""
         if not DEVICE_ID_RE.match(device_id or ""):
             raise ValueError("bad device_id")
+        if not KEY_RE.match(key or ""):
+            raise ValueError("bad key")
         kept = sorted({t for t in tools if isinstance(t, str) and t in TOOLS})
         clean = "".join(ch for ch in str(name or "") if ch.isprintable())[:MAX_NAME].strip() or "Phone"
         with self.store._lock():
             phones = self._phones()
-            if kept:
-                phones[device_id] = {"name": clean, "tools": kept, "seen": int(self.clock())}
-            else:
-                phones.pop(device_id, None)
+            known = phones.get(device_id, {}).get("key")
+            if isinstance(known, str) and not hmac.compare_digest(known, self._hash(key)):
+                raise ValueError("this phone id is held by another key")
+            # Kept with no tools too: the key stays bound to the id.
+            phones[device_id] = {"name": clean, "tools": kept, "seen": int(self.clock()), "key": self._hash(key)}
             _write_private(self.root / "phones.json", phones)
-        if not kept:
-            # Nothing on any more: refuse what is still waiting for this phone.
-            for request in self.pending(device_id):
+        _refresh_tool_list()
+        # What is still waiting for a tool that's off now is refused.
+        for request in self.pending(device_id):
+            if request["tool"] not in kept:
                 self.answer(device_id, request["id"], None, "The user turned this tool off on the phone.")
         return kept
 
     def phone_for(self, tool: str) -> Optional[str]:
         """The phone that offers [tool], the most recently heard from first."""
         now = self.clock()
-        offering = [(v.get("seen", 0), k) for k, v in self._phones().items()
+        offering = [(int(v.get("seen", 0)), k) for k, v in self._phones().items()
                     if tool in (v.get("tools") or []) and now - int(v.get("seen", 0)) < STALE_SECONDS]
         return max(offering)[1] if offering else None
 
@@ -246,15 +272,14 @@ class Phones:
                     if answer.get("ok"):
                         return json.dumps(answer.get("result"), ensure_ascii=False)
                     return _error(str(answer.get("error") or "The phone couldn't do it."))
+                if self.interrupted():
+                    return _error("Stopped before the phone answered.")
                 time.sleep(POLL_SECONDS)
             return _error("The phone didn't answer in time. Herald may be closed, offline or not connected to "
                           "this gateway, or the user didn't respond.")
         finally:
             for kind in ("req", "res"):
-                try:
-                    self._path(request_id, kind).unlink()
-                except OSError:
-                    pass
+                _unlink(self._path(request_id, kind))
 
     def _wake(self, device_id: str, request_id: str) -> None:
         try:
@@ -270,19 +295,27 @@ class Phones:
             return None
         return data if isinstance(data, dict) else None
 
-    def pending(self, device_id: str) -> List[dict]:
-        """Requests waiting for [device_id], oldest first."""
-        now = self.clock()
-        out = []
-        for path in sorted(self.root.glob("*.req.json")) if self.root.is_dir() else []:
-            request = self._read(path)
-            if request is None:
-                continue
-            if now - int(request.get("created", 0)) > LEFTOVER_SECONDS:
+    def _sweep(self) -> None:
+        """Removes what a process that died, or an answer that came too late, left behind."""
+        cutoff = time.time() - LEFTOVER_SECONDS
+        for pattern in ("*.req.json", "*.res.json", ".tmp-*"):
+            for path in self.root.glob(pattern):
                 try:
-                    path.unlink()
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
                 except OSError:
                     pass
+
+    def pending(self, device_id: str) -> List[dict]:
+        """Requests waiting for [device_id], oldest first."""
+        if not self.root.is_dir():
+            return []
+        self._sweep()
+        now = self.clock()
+        out = []
+        for path in sorted(self.root.glob("*.req.json")):
+            request = self._read(path)
+            if request is None:
                 continue
             if request.get("device_id") != device_id or now > int(request.get("expires", 0)):
                 continue
@@ -303,16 +336,98 @@ class Phones:
         body = {"ok": error is None, "result": result} if error is None else {"ok": False, "error": str(error)[:500]}
         if len(json.dumps(body, ensure_ascii=False)) > MAX_RESULT:
             body = {"ok": False, "error": "The phone's answer was too long."}
-        _write_private(self._path(request_id, "res"), body)
+        path = self._path(request_id, "res")
+        _write_private(path, body)
+        if not self._path(request_id, "req").exists():
+            # The tool gave up while this was written: nobody will read it.
+            _unlink(path)
+            return False
         return True
+
+    @staticmethod
+    def interrupted() -> bool:
+        """Whether the user stopped the turn this tool runs in."""
+        try:
+            from tools.interrupt import is_interrupted
+        except ImportError:
+            return False
+        try:
+            return bool(is_interrupted())
+        except Exception:
+            return False
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _error(text: str) -> str:
     return json.dumps({"error": text})
 
 
+def _refresh_tool_list() -> None:
+    """Makes this process build its tool list again: Hermes caches it, and a check_fn's answer isn't part of
+    the cache key. Private names, so each step is optional."""
+    try:
+        from tools.registry import registry
+        with registry._lock:
+            registry._generation += 1
+    except Exception:
+        pass
+    try:
+        from model_tools import _clear_tool_defs_cache
+        _clear_tool_defs_cache()
+    except Exception:
+        pass
+
+
+def on_messaging_platform() -> bool:
+    """Whether this turn came from a messaging platform (Telegram, Discord, ...), where others can talk to the
+    bot. Unknown counts as no: the dashboard, Herald, Desktop, cron and the CLI don't set a platform."""
+    try:
+        from gateway.session_context import session_is_messaging_surface
+    except ImportError:
+        return False
+    try:
+        return bool(session_is_messaging_surface())
+    except Exception:
+        return False
+
+
+class _Watch(threading.Thread):
+    """Refreshes this process's tool list when another process records a phone's switches."""
+
+    def __init__(self, path: Path):
+        super().__init__(name="herald-push-phone-watch", daemon=True)
+        self.path = path
+        self.stopped = threading.Event()
+
+    def _stamp(self):
+        try:
+            st = self.path.stat()
+            return st.st_mtime_ns, st.st_size
+        except OSError:
+            return None
+
+    def run(self) -> None:
+        last = self._stamp()
+        while not self.stopped.wait(WATCH_SECONDS):
+            now = self._stamp()
+            if now != last:
+                last = now
+                _refresh_tool_list()
+
+
+_watch_lock = threading.Lock()
+_watch: Optional[_Watch] = None
+
+
 def register_tools(ctx, phones: Phones) -> None:
     """Every phone tool, each offered only while a phone has it on."""
+    global _watch
     try:
         from tools.registry import no_cache_check_fn
     except ImportError:  # older Hermes: the check is cached for 30 s
@@ -321,6 +436,9 @@ def register_tools(ctx, phones: Phones) -> None:
 
     for name, (schema, _timeout, emoji) in TOOLS.items():
         def handler(args, session_id: str = "", _name=name, **_kwargs):
+            if on_messaging_platform():
+                return _error("Phone tools only work in chats from Herald, Desktop or the dashboard, not on a "
+                              "messaging platform.")
             return phones.call(_name, args, session_id)
 
         def check(_name=name) -> bool:
@@ -328,3 +446,20 @@ def register_tools(ctx, phones: Phones) -> None:
 
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler,
                           check_fn=no_cache_check_fn(check), emoji=emoji)
+
+    with _watch_lock:
+        if _watch is None:
+            _watch = _Watch(phones.root / "phones.json")
+            _watch.start()
+            started = _watch
+
+            def stop() -> None:
+                global _watch
+                with _watch_lock:
+                    if _watch is started:
+                        _watch.stopped.set()
+                        _watch = None
+
+            on_unload = getattr(ctx, "on_unload", None)
+            if on_unload is not None:
+                on_unload(stop)

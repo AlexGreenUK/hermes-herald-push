@@ -40,7 +40,12 @@ Agent tools that run on the phone, in the `herald_phone` toolset: `phone_battery
 
 - **Off until the user turns them on.** Each tool has its own switch in Herald (Settings → Phone tools). Herald
   tells the gateway which ones are on with `/herald-push phone tools`, and a tool no phone has on is not
-  offered to the agent at all. Turning one off takes it away on the next turn, and refuses a call still waiting.
+  offered to the agent at all. Hermes fixes a chat's tools when the chat starts, so a switch changes what new
+  chats get; a call from an older chat to a tool that's off now is refused, and so is a call still waiting.
+- **Not on messaging platforms.** A turn from Telegram, Discord and the like gets a refusal: others may be
+  talking to the bot there.
+- **One phone, one key.** The first report binds the phone's id to a secret key (the gateway keeps its
+  hash), and every later phone command must carry it.
 - **Changes ask first.** Setting an alarm or Do Not Disturb, opening something, copying, adding or moving an
   event and adding a watched place are shown on the phone, and only happen if the user allows them there.
 - **How a call travels.** The tool writes a request file to `<hermes root>/plugin-data/herald-push/phone/`
