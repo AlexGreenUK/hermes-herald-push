@@ -126,9 +126,9 @@ TOOLS: Dict[str, tuple] = {
         }, ["kind", "value"]), CONFIRM_TIMEOUT, "📲"),
     "phone_clipboard": (_schema(
         "phone_clipboard",
-        "Put text on the user's phone clipboard, ready to paste. Shown on the phone and only copied if the user "
-        "allows it.",
-        {"text": {"type": "string", "maxLength": 4000}}, ["text"]), CONFIRM_TIMEOUT, "📋"),
+        "Put text on the user's phone clipboard, ready to paste. Shown on the phone, all of it, and only copied "
+        "if the user allows it; at most 300 characters, so the user can read it first.",
+        {"text": {"type": "string", "maxLength": 300}}, ["text"]), CONFIRM_TIMEOUT, "📋"),
     "phone_location": (_schema(
         "phone_location",
         "Where the user's phone is: latitude, longitude, accuracy in meters, when it was measured, and the "
